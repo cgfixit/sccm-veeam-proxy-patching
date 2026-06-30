@@ -118,7 +118,7 @@ try {
                     Get-Service Veeam* | Stop-Service -Force
                 }
             } catch {
-                Write-ProxyLog "Failed to stop Veeam services on $Node: $_" 'ERROR' -ToConsole; exit 40
+                Write-ProxyLog "Failed to stop Veeam services on ${Node}: $_" 'ERROR' -ToConsole; exit 40
             }
         }
 
@@ -136,7 +136,7 @@ try {
                     Get-Service Veeam* | Start-Service
                 }
             } catch {
-                Write-ProxyLog "Failed to start Veeam services on $Node: $_" 'ERROR' -ToConsole; exit 50
+                Write-ProxyLog "Failed to start Veeam services on ${Node}: $_" 'ERROR' -ToConsole; exit 50
             }
         }
 
