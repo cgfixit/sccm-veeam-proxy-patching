@@ -1,5 +1,5 @@
 BeforeAll {
-    $ScriptPath = Join-Path $PSScriptRoot '..' 'sccmpatch.ps1'
+    $ScriptPath = Join-Path -Path $PSScriptRoot -ChildPath '..' -AdditionalChildPath 'sccmpatch.ps1'
 
     function Get-ScriptAst {
         [System.Management.Automation.Language.Parser]::ParseFile(
