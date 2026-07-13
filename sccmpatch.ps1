@@ -1,162 +1,261 @@
 <#
 Author: Chris Grady (cgfixit.com & cgfixit.com/code)
-Internal Use initially but any native PS functions can be used to re-purpose this script for Veeam or any SCCM patching
-Validated against Veeam Backup & Replication 12.3.2 on 2025-09-24
 
-Purpose  :  Gracefully drain selected VMware proxies, stop Veeam services for patching/reboot, then return them to production.
-Description: Graceful Veeam VMware proxy maintenance helper for patching/reboots.
-Pre stage: disable selected proxies, wait for backup tasks to drain, then stop Veeam services safely for patching/reboot.
-Post stage: start services, re-enable proxies, and return 3010 if a Windows reboot is pending so SCCM/ConfigMgr can handle it.
-ExitCodes: 0  = Success
-           10 = Proxy objects not found
-           20 = Disable failed          (Pre)
-           30 = Task-drain timeout      (Pre)
-           40 = Stop-service failure    (Pre)
-           50 = Start-service failure   (Post)
-           60 = Re-enable failure       (Post)
-           90 = Invalid Stage argument
-           99 = Unhandled error
-           3010 = Reboot pending (Post, for SCCM)
-           
-NOTED Requirements:
-Proxies must exist in VBR configuration (modify -Proxies param as needed)
-WinRM enabled on both proxy servers
-Account has Backup Administrator role in VBR
-Account has local administrator rights on proxy servers
-PowerShell execution policy allows script execution 
-MFA: Disabled for the account launching PowerShell
-Network connectivity between script host and proxies and VBR
---
-Troubleshooting:
+Purpose  : Gracefully drain selected VMware proxies, stop Veeam services for
+           patching/reboot, then return them to production.
+Pre      : Disable selected proxies, wait for backup tasks to drain, then stop
+           Veeam services safely for patching/reboot.
+Post     : Start services, re-enable proxies, and return 3010 when the script
+           host has a pending Windows reboot.
 
-Task Drain Delay:
-Use Suspend-VBRJob to pause jobs feeding these proxies.
-Check Instant Recovery sessions — they may hold proxy resources.
-Service Stop Failures
-
-Misc:
-Run Get-Service Veeam* manually to confirm service names.
-Ensure no orphaned TCP connections (Get-NetTCPConnection).
+Exit codes:
+    0    Success
+    10   Proxy objects not found
+    20   Disable failed (Pre)
+    30   Task-drain timeout (Pre)
+    40   Stop-service failure (Pre)
+    50   Start-service failure (Post)
+    60   Re-enable failure (Post)
+    90   Invalid Stage argument
+    99   Unhandled error
+    3010 Reboot pending (Post, for SCCM)
 #>
-
 
 [CmdletBinding()]
 param(
-    [ValidateSet('Pre','Post')]
     [string]$Stage = 'Pre',
-    [string[]]$Proxies = @('F-1', 'M-1'),  # Default batch; override via param/host names of proxy in your env
-    [int]$PollDelay = 30,                  # Seconds between task-drain checks
-    [int]$DrainTimeoutMinutes = 30         # Max wait time for drain (keep in mind 30 min may need more time if jobs running)
+    [string[]]$Proxies = @('F-1', 'M-1'),
+    [ValidateRange(1, 3600)]
+    [int]$PollDelay = 30,
+    [ValidateRange(1, 1440)]
+    [int]$DrainTimeoutMinutes = 30
 )
 
-$LogPath = "$env:TEMP\ProxyMaintenance_$(Get-Date -f 'yyyyMMdd-HHmmss').log"
-function Write-ProxyLog { param([string]$Msg, [string]$Level='INFO', [switch]$ToConsole) 
-    Add-Content $LogPath "$(Get-Date -f 'yyyy-MM-dd HH:mm:ss') [$Level] $Msg"
-    if ($ToConsole) { Write-Host $Msg -ForegroundColor Cyan }
+$script:LogPath = $null
+
+function Initialize-ProxyLog {
+    $script:LogPath = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath (
+        'ProxyMaintenance_{0}.log' -f (Get-Date -Format 'yyyyMMdd-HHmmss')
+    )
 }
 
-Write-ProxyLog "Process begins (Stage: $Stage, Proxies: $($Proxies -join ', '))" -ToConsole
+function Write-ProxyLog {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Msg,
+        [string]$Level = 'INFO',
+        [switch]$ToConsole
+    )
 
-Import-Module Veeam.Backup.PowerShell -ErrorAction Stop
-
-try {
-    $ErrorActionPreference = 'Stop'
-
-    #------------------------------------------------------------
-    # Common: get proxy objects
-    #------------------------------------------------------------
-    $ProxyObjs = Get-VBRViProxy -Name $Proxies
-    if (-not $ProxyObjs) {
-        Write-ProxyLog "No matching proxies found!" 'ERROR' -ToConsole; exit 10
+    $entry = '{0} [{1}] {2}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Level, $Msg
+    try {
+        Add-Content -LiteralPath $script:LogPath -Value $entry -ErrorAction Stop
+    }
+    catch {
+        Write-Warning ('Unable to write log file: {0}' -f $_.Exception.Message)
     }
 
-    #------------------------------------------------------------
-    if ($Stage -eq 'Pre') {
-    #------------------------------------------------------------
-        # Disable proxies
-        try { $ProxyObjs | Disable-VBRViProxy }
-        catch { Write-ProxyLog "Failed to disable proxies: $_" 'ERROR' -ToConsole; exit 20 }
+    if ($ToConsole) {
+        Write-Host $Msg -ForegroundColor Cyan
+    }
+}
 
-        # Drain running tasks (fixed filtering)
-        Write-ProxyLog ">>> Waiting for active tasks to drain…" -ToConsole
-        $ProxyIdSet = @{}
-        foreach ($p in $ProxyObjs) { $ProxyIdSet[$p.Id] = $p.Name }
-        $StartTime = Get-Date
-        do {
-            $runningSessions = Get-VBRBackupSession | Where-Object { $_.State -eq "Working" }
-            $runningTasks = @()
-            if ($runningSessions) {
-                $runningTasks = @($runningSessions | Get-VBRTaskSession | Where-Object { $_.Status -eq "InProgress" })
-            }
-            $Busy = $false
-            foreach ($task in $runningTasks) {
-                $proxyId = $null
-                if ($task.Info -and $task.Info.WorkDetails) {
-                    $proxyId = $task.Info.WorkDetails.SourceProxyId
-                }
-                if ($proxyId -and $ProxyIdSet.ContainsKey($proxyId)) {
-                    $Busy = $true
-                    Write-ProxyLog "Task still active on proxy $($ProxyIdSet[$proxyId]): $($task.Name)" 'WARN' -ToConsole
+function Wait-ProxyTasksToDrain {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [object[]]$ProxyObjects,
+        [Parameter(Mandatory)]
+        [int]$PollDelay,
+        [Parameter(Mandatory)]
+        [int]$DrainTimeoutMinutes
+    )
+
+    Write-ProxyLog 'Waiting for active tasks to drain...' -ToConsole
+    $proxyIdSet = @{}
+    foreach ($proxy in $ProxyObjects) {
+        if ($null -ne $proxy.Id) {
+            $proxyIdSet[$proxy.Id] = $proxy.Name
+        }
+    }
+
+    $startTime = Get-Date
+    do {
+        $runningSessions = @(
+            Get-VBRBackupSession -ErrorAction Stop |
+                Where-Object { $_.State -eq 'Working' }
+        )
+        $runningTasks = @()
+        if ($runningSessions.Count -gt 0) {
+            $runningTasks = @(
+                $runningSessions |
+                    Get-VBRTaskSession -ErrorAction Stop |
+                    Where-Object { $_.Status -eq 'InProgress' }
+            )
+        }
+
+        $busyTask = $null
+        foreach ($task in $runningTasks) {
+            if ($task.Info -and $task.Info.WorkDetails) {
+                $proxyId = $task.Info.WorkDetails.SourceProxyId
+                if ($proxyId -and $proxyIdSet.ContainsKey($proxyId)) {
+                    $busyTask = $task
                     break
                 }
             }
-            if ($Busy) {
-                if (((Get-Date) - $StartTime).TotalMinutes -gt $DrainTimeoutMinutes) {
-                    Write-ProxyLog "Task drain timeout after $DrainTimeoutMinutes minutes" 'ERROR' -ToConsole; exit 30
-                }
-                Write-ProxyLog (" {0} task(s) still running – sleeping {1}s" -f $runningTasks.Count, $PollDelay) -ToConsole
-                Start-Sleep -Seconds $PollDelay
-            }
-        } until (-not $Busy)
-            Write-ProxyLog ">>> No active tasks – stopping services." 'INFO' -ToConsole
-
-        # Stop services on each proxy
-        foreach ($Node in $Proxies) {
-            try {
-                Write-ProxyLog " Stopping Veeam services on $Node …" -ToConsole
-                Invoke-Command -ComputerName $Node -ScriptBlock {
-                    Get-Service Veeam* | Stop-Service -Force
-                }
-            } catch {
-                Write-ProxyLog "Failed to stop Veeam services on ${Node}: $_" 'ERROR' -ToConsole; exit 40
-            }
         }
 
-        Write-ProxyLog "Stage Pre completed successfully" -ToConsole; exit 0
-    }
+        if ($busyTask) {
+            Write-ProxyLog (
+                'Task still active on proxy {0}: {1}' -f
+                $proxyIdSet[$busyTask.Info.WorkDetails.SourceProxyId], $busyTask.Name
+            ) 'WARN' -ToConsole
 
-    #------------------------------------------------------------
-    elseif ($Stage -eq 'Post') {
-    #------------------------------------------------------------
-        # Start services on each proxy
-        foreach ($Node in $Proxies) {
-            try {
-                Write-ProxyLog " Starting Veeam services on $Node …" -ToConsole
-                Invoke-Command -ComputerName $Node -ScriptBlock {
-                    Get-Service Veeam* | Start-Service
-                }
-            } catch {
-                Write-ProxyLog "Failed to start Veeam services on ${Node}: $_" 'ERROR' -ToConsole; exit 50
+            if (((Get-Date) - $startTime).TotalMinutes -ge $DrainTimeoutMinutes) {
+                throw [System.TimeoutException]::new(
+                    ('Task drain timeout after {0} minutes.' -f $DrainTimeoutMinutes)
+                )
             }
+
+            Write-ProxyLog (
+                '{0} active task(s) remain; sleeping {1}s.' -f $runningTasks.Count, $PollDelay
+            ) -ToConsole
+            Start-Sleep -Seconds $PollDelay
         }
+    } while ($busyTask)
 
-        # Re-enable proxies
-        try { $ProxyObjs | Enable-VBRViProxy }
-        catch { Write-ProxyLog "Failed to re-enable proxies: $_" 'ERROR' -ToConsole; exit 60 }
+    Write-ProxyLog 'No active tasks; stopping services.' -ToConsole
+}
 
-        # Check for reboot pending (for SCCM)
-        if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') { 
-            Write-ProxyLog "Reboot pending detected" 'WARN' -ToConsole; exit 3010 
-        }
+function Invoke-ProxyServiceAction {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string[]]$ProxyNames,
+        [Parameter(Mandatory)]
+        [ValidateSet('Start', 'Stop')]
+        [string]$Action
+    )
 
-        Write-ProxyLog "Stage Post completed successfully" -ToConsole; exit 0
-    }
+    foreach ($node in $ProxyNames) {
+        $verb = if ($Action -eq 'Start') { 'Starting' } else { 'Stopping' }
+        Write-ProxyLog ('{0} Veeam services on {1}...' -f $verb, $node) -ToConsole
+        Invoke-Command -ComputerName $node -ErrorAction Stop -ScriptBlock {
+            param($ServiceAction)
 
-    #------------------------------------------------------------
-    else {
-        Write-ProxyLog "Invalid -Stage argument. Use Pre or Post." 'ERROR' -ToConsole; exit 90
+            $services = @(Get-Service -Name 'Veeam*' -ErrorAction Stop)
+            if ($services.Count -eq 0) {
+                throw 'No Veeam services were found.'
+            }
+
+            if ($ServiceAction -eq 'Stop') {
+                $services | Stop-Service -Force -ErrorAction Stop
+            }
+            else {
+                $services | Start-Service -ErrorAction Stop
+            }
+        } -ArgumentList $Action
     }
 }
-catch {
-    Write-ProxyLog "Unhandled error: $_" 'ERROR' -ToConsole; exit 99
+
+function Invoke-ProxyMaintenance {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Stage,
+        [string[]]$Proxies,
+        [Parameter(Mandatory)]
+        [int]$PollDelay,
+        [Parameter(Mandatory)]
+        [int]$DrainTimeoutMinutes
+    )
+
+    $ErrorActionPreference = 'Stop'
+    Initialize-ProxyLog
+
+    try {
+        Write-ProxyLog ('Process begins (Stage: {0}, Proxies: {1})' -f $Stage, ($Proxies -join ', ')) -ToConsole
+
+        if (($Stage -ne 'Pre') -and ($Stage -ne 'Post')) {
+            Write-ProxyLog 'Invalid -Stage argument. Use Pre or Post.' 'ERROR' -ToConsole
+            return 90
+        }
+
+        if (-not $Proxies -or $Proxies.Count -eq 0) {
+            Write-ProxyLog 'No proxy names were supplied.' 'ERROR' -ToConsole
+            return 10
+        }
+
+        Import-Module Veeam.Backup.PowerShell -ErrorAction Stop
+        $proxyObjects = @(Get-VBRViProxy -Name $Proxies -ErrorAction Stop)
+        if ($proxyObjects.Count -eq 0) {
+            Write-ProxyLog 'No matching proxies found.' 'ERROR' -ToConsole
+            return 10
+        }
+
+        if ($Stage -eq 'Pre') {
+            try {
+                $proxyObjects | Disable-VBRViProxy -ErrorAction Stop
+            }
+            catch {
+                Write-ProxyLog ('Failed to disable proxies: {0}' -f $_) 'ERROR' -ToConsole
+                return 20
+            }
+
+            try {
+                Wait-ProxyTasksToDrain -ProxyObjects $proxyObjects -PollDelay $PollDelay -DrainTimeoutMinutes $DrainTimeoutMinutes
+            }
+            catch [System.TimeoutException] {
+                Write-ProxyLog $_.Exception.Message 'ERROR' -ToConsole
+                return 30
+            }
+            catch {
+                Write-ProxyLog ('Failed while draining proxy tasks: {0}' -f $_) 'ERROR' -ToConsole
+                return 99
+            }
+
+            try {
+                Invoke-ProxyServiceAction -ProxyNames $Proxies -Action Stop
+            }
+            catch {
+                Write-ProxyLog ('Failed to stop Veeam services: {0}' -f $_) 'ERROR' -ToConsole
+                return 40
+            }
+
+            Write-ProxyLog 'Stage Pre completed successfully' -ToConsole
+            return 0
+        }
+
+        try {
+            Invoke-ProxyServiceAction -ProxyNames $Proxies -Action Start
+        }
+        catch {
+            Write-ProxyLog ('Failed to start Veeam services: {0}' -f $_) 'ERROR' -ToConsole
+            return 50
+        }
+
+        try {
+            $proxyObjects | Enable-VBRViProxy -ErrorAction Stop
+        }
+        catch {
+            Write-ProxyLog ('Failed to re-enable proxies: {0}' -f $_) 'ERROR' -ToConsole
+            return 60
+        }
+
+        if (Test-Path -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') {
+            Write-ProxyLog 'Reboot pending detected' 'WARN' -ToConsole
+            return 3010
+        }
+
+        Write-ProxyLog 'Stage Post completed successfully' -ToConsole
+        return 0
+    }
+    catch {
+        Write-ProxyLog ('Unhandled error: {0}' -f $_) 'ERROR' -ToConsole
+        return 99
+    }
+}
+
+if ($MyInvocation.InvocationName -ne '.') {
+    exit (Invoke-ProxyMaintenance -Stage $Stage -Proxies $Proxies -PollDelay $PollDelay -DrainTimeoutMinutes $DrainTimeoutMinutes)
 }
