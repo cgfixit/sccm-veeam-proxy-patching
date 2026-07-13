@@ -103,6 +103,61 @@ Describe 'sccmpatch.ps1 SCCM exit-code contract' {
         Should -Invoke Invoke-Command -Times 1
     }
 
+    It 'returns 40 when stopping proxy services fails' {
+        Mock Write-ProxyLog {}
+        Mock Import-Module {}
+        Mock Get-VBRViProxy { @([pscustomobject]@{ Id = 'proxy-1'; Name = 'Proxy1' }) }
+        Mock Disable-VBRViProxy {}
+        Mock Get-VBRBackupSession { @() }
+        Mock Invoke-Command { throw 'stop failed' }
+
+        $result = Invoke-ProxyMaintenance -Stage 'Pre' -Proxies @('Proxy1') -PollDelay 1 -DrainTimeoutMinutes 1
+
+        $result | Should -Be 40
+    }
+
+    It 'returns 50 when starting proxy services fails' {
+        Mock Write-ProxyLog {}
+        Mock Import-Module {}
+        Mock Get-VBRViProxy { @([pscustomobject]@{ Id = 'proxy-1'; Name = 'Proxy1' }) }
+        Mock Invoke-Command { throw 'start failed' }
+
+        $result = Invoke-ProxyMaintenance -Stage 'Post' -Proxies @('Proxy1') -PollDelay 1 -DrainTimeoutMinutes 1
+
+        $result | Should -Be 50
+    }
+
+    It 'returns 60 when re-enabling proxies fails' {
+        Mock Write-ProxyLog {}
+        Mock Import-Module {}
+        Mock Get-VBRViProxy { @([pscustomobject]@{ Id = 'proxy-1'; Name = 'Proxy1' }) }
+        Mock Invoke-Command {}
+        Mock Enable-VBRViProxy { throw 'enable failed' }
+
+        $result = Invoke-ProxyMaintenance -Stage 'Post' -Proxies @('Proxy1') -PollDelay 1 -DrainTimeoutMinutes 1
+
+        $result | Should -Be 60
+    }
+
+    It 'returns 99 when the Veeam module cannot load' {
+        Mock Write-ProxyLog {}
+        Mock Import-Module { throw 'module missing' }
+
+        $result = Invoke-ProxyMaintenance -Stage 'Pre' -Proxies @('Proxy1') -PollDelay 1 -DrainTimeoutMinutes 1
+
+        $result | Should -Be 99
+    }
+
+    It 'supports WhatIf without loading Veeam' {
+        Mock Write-ProxyLog {}
+        Mock Import-Module {}
+
+        $result = Invoke-ProxyMaintenance -Stage 'Pre' -Proxies @('Proxy1') -PollDelay 1 -DrainTimeoutMinutes 1 -WhatIf
+
+        $result | Should -Be 0
+        Should -Invoke Import-Module -Times 0
+    }
+
     It 'returns 30 when a targeted task remains past the drain timeout' {
         Mock Write-ProxyLog {}
         $script:DrainTestTime = [datetime]'2026-01-01T00:00:00'
@@ -129,6 +184,25 @@ Describe 'sccmpatch.ps1 SCCM exit-code contract' {
         }
 
         $result | Should -Be 30
+    }
+
+    It 'ignores active tasks that use an unselected proxy' {
+        Mock Write-ProxyLog {}
+        Mock Start-Sleep {}
+        Mock Get-VBRBackupSession { @([pscustomobject]@{ State = 'Working' }) }
+        Mock Get-VBRTaskSession {
+            @([pscustomobject]@{
+                Status = 'InProgress'
+                Name = 'Other proxy task'
+                Info = [pscustomobject]@{
+                    WorkDetails = [pscustomobject]@{ SourceProxyId = 'other-proxy' }
+                }
+            })
+        }
+
+        { Wait-ProxyTasksToDrain -ProxyObjects @([pscustomobject]@{ Id = 'proxy-1'; Name = 'Proxy1' }) -PollDelay 1 -DrainTimeoutMinutes 1 } |
+            Should -Not -Throw
+        Should -Invoke Start-Sleep -Times 0
     }
 }
 

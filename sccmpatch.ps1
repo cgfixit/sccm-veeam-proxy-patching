@@ -128,7 +128,7 @@ function Wait-ProxyTasksToDrain {
 }
 
 function Invoke-ProxyServiceAction {
-    [CmdletBinding()]
+    [CmdletBinding(SupportsShouldProcess)]
     param(
         [Parameter(Mandatory)]
         [string[]]$ProxyNames,
@@ -140,26 +140,28 @@ function Invoke-ProxyServiceAction {
     foreach ($node in $ProxyNames) {
         $verb = if ($Action -eq 'Start') { 'Starting' } else { 'Stopping' }
         Write-ProxyLog ('{0} Veeam services on {1}...' -f $verb, $node) -ToConsole
-        Invoke-Command -ComputerName $node -ErrorAction Stop -ScriptBlock {
-            param($ServiceAction)
+        if ($PSCmdlet.ShouldProcess($node, ('{0} Veeam services' -f $Action))) {
+            Invoke-Command -ComputerName $node -ErrorAction Stop -ScriptBlock {
+                param($ServiceAction)
 
-            $services = @(Get-Service -Name 'Veeam*' -ErrorAction Stop)
-            if ($services.Count -eq 0) {
-                throw 'No Veeam services were found.'
-            }
+                $services = @(Get-Service -Name 'Veeam*' -ErrorAction Stop)
+                if ($services.Count -eq 0) {
+                    throw 'No Veeam services were found.'
+                }
 
-            if ($ServiceAction -eq 'Stop') {
-                $services | Stop-Service -Force -ErrorAction Stop
-            }
-            else {
-                $services | Start-Service -ErrorAction Stop
-            }
-        } -ArgumentList $Action
+                if ($ServiceAction -eq 'Stop') {
+                    $services | Stop-Service -Force -ErrorAction Stop
+                }
+                else {
+                    $services | Start-Service -ErrorAction Stop
+                }
+            } -ArgumentList $Action
+        }
     }
 }
 
 function Invoke-ProxyMaintenance {
-    [CmdletBinding()]
+    [CmdletBinding(SupportsShouldProcess)]
     param(
         [Parameter(Mandatory)]
         [string]$Stage,
@@ -184,6 +186,10 @@ function Invoke-ProxyMaintenance {
         if (-not $Proxies -or $Proxies.Count -eq 0) {
             Write-ProxyLog 'No proxy names were supplied.' 'ERROR' -ToConsole
             return 10
+        }
+
+        if (-not $PSCmdlet.ShouldProcess(($Proxies -join ', '), ('Run {0} proxy maintenance' -f $Stage))) {
+            return 0
         }
 
         Import-Module Veeam.Backup.PowerShell -ErrorAction Stop
