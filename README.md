@@ -62,10 +62,10 @@ powershell
 Parameters
 Table
 Parameter	Type	Default	Description
--Stage	string	Pre	Execution stage: Pre (disable/drain/stop) or Post (start/re-enable/reboot signal).
+-Stage	string	Pre	Execution stage: Pre (disable/drain/stop) or Post (start/re-enable/reboot signal). Invalid values return code 90.
 -Proxies	string[]	@('Proxy1','Proxy2')	Array of proxy hostnames (as known to VBR) to target. Override with your environment names.
--PollDelay	int	30	Seconds between task-drain polls. Lower = faster detection, higher = less VBR API chatter.
--DrainTimeoutMinutes	int	30	Maximum wait time for active tasks using the targeted proxies to complete. If exceeded, exits with code 30.
+-PollDelay	int	30	Seconds between task-drain polls. Must be at least 1. Lower = faster detection, higher = less VBR API chatter.
+-DrainTimeoutMinutes	int	30	Maximum wait time for active tasks using the targeted proxies to complete. Must be at least 1. If exceeded, exits with code 30.
 Exit Codes
 Table
 Code	Stage	Meaning	Action in SCCM

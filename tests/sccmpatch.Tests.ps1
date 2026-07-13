@@ -1,164 +1,225 @@
 BeforeAll {
-    $ScriptPath = Join-Path -Path $PSScriptRoot -ChildPath '..' -AdditionalChildPath 'sccmpatch.ps1'
+    $ScriptPath = (Resolve-Path (Join-Path -Path $PSScriptRoot -ChildPath '..\sccmpatch.ps1')).Path
+
+    # Dot-sourcing imports functions without running Veeam or WinRM operations.
+    . $ScriptPath
+
+    # Pester requires a command to exist before it can mock it.
+    function Get-VBRViProxy {}
+    function Disable-VBRViProxy {}
+    function Get-VBRBackupSession {}
+    function Get-VBRTaskSession {}
+    function Enable-VBRViProxy {}
 
     function Get-ScriptAst {
-        [System.Management.Automation.Language.Parser]::ParseFile(
-            $ScriptPath, [ref]$null, [ref]$null
-        )
-    }
-}
-
-Describe 'sccmpatch.ps1 static analysis' {
-
-    It 'parses without syntax errors' {
         $errors = $null
-        [System.Management.Automation.Language.Parser]::ParseFile(
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile(
             $ScriptPath, [ref]$null, [ref]$errors
         )
         $errors | Should -BeNullOrEmpty
-    }
-
-    It 'declares the Stage parameter with ValidateSet Pre,Post' {
-        $ast = Get-ScriptAst
-        $param = $ast.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq 'Stage' }
-        $param | Should -Not -BeNullOrEmpty
-        $validateSet = $param.Attributes | Where-Object { $_.TypeName.Name -eq 'ValidateSet' }
-        $validateSet | Should -Not -BeNullOrEmpty
-        $values = $validateSet.PositionalArguments.Value
-        $values | Should -Contain 'Pre'
-        $values | Should -Contain 'Post'
-    }
-
-    It 'declares the Proxies parameter as string array' {
-        $ast = Get-ScriptAst
-        $param = $ast.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq 'Proxies' }
-        $param | Should -Not -BeNullOrEmpty
-        $typeAttr = $param.Attributes | Where-Object { $_.TypeName.Name -eq 'string[]' }
-        $typeAttr | Should -Not -BeNullOrEmpty
-    }
-
-    It 'declares PollDelay as int with default 30' {
-        $ast = Get-ScriptAst
-        $param = $ast.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq 'PollDelay' }
-        $param | Should -Not -BeNullOrEmpty
-        $param.DefaultValue.Value | Should -Be 30
-    }
-
-    It 'declares DrainTimeoutMinutes as int with default 30' {
-        $ast = Get-ScriptAst
-        $param = $ast.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq 'DrainTimeoutMinutes' }
-        $param | Should -Not -BeNullOrEmpty
-        $param.DefaultValue.Value | Should -Be 30
-    }
-
-    It 'has CmdletBinding attribute' {
-        $ast = Get-ScriptAst
-        $cmdletBinding = $ast.ParamBlock.Attributes | Where-Object { $_.TypeName.Name -eq 'CmdletBinding' }
-        $cmdletBinding | Should -Not -BeNullOrEmpty
+        return $ast
     }
 }
 
-Describe 'sccmpatch.ps1 exit code coverage' {
+Describe 'sccmpatch.ps1 parser and parameters' {
 
-    It 'defines all documented exit codes in the script' {
-        $content = Get-Content $ScriptPath -Raw
-        $expectedCodes = @(0, 10, 20, 30, 40, 50, 60, 90, 99, 3010)
-        foreach ($code in $expectedCodes) {
-            $content | Should -Match "exit\s+$code"
+    It 'parses without syntax errors' {
+        { Get-ScriptAst } | Should -Not -Throw
+    }
+
+    It 'declares the expected script parameters' {
+        $ast = Get-ScriptAst
+        $names = $ast.ParamBlock.Parameters.Name.VariablePath.UserPath
+
+        $names | Should -Contain 'Stage'
+        $names | Should -Contain 'Proxies'
+        $names | Should -Contain 'PollDelay'
+        $names | Should -Contain 'DrainTimeoutMinutes'
+    }
+
+    It 'keeps numeric polling parameters above zero' {
+        $ast = Get-ScriptAst
+        foreach ($name in @('PollDelay', 'DrainTimeoutMinutes')) {
+            $param = $ast.ParamBlock.Parameters | Where-Object {
+                $_.Name.VariablePath.UserPath -eq $name
+            }
+            $range = $param.Attributes | Where-Object { $_.TypeName.Name -eq 'ValidateRange' }
+            $range | Should -Not -BeNullOrEmpty
+            $range.PositionalArguments[0].Value | Should -Be 1
         }
     }
 
-    It 'exits 10 when no proxies are found' {
-        $content = Get-Content $ScriptPath -Raw
-        $content | Should -Match 'No matching proxies found.*exit 10'
-    }
-
-    It 'exits 20 on disable failure' {
-        $content = Get-Content $ScriptPath -Raw
-        $content | Should -Match 'Failed to disable proxies.*exit 20'
-    }
-
-    It 'exits 30 on drain timeout' {
-        $content = Get-Content $ScriptPath -Raw
-        $content | Should -Match 'Task drain timeout.*exit 30'
-    }
-
-    It 'exits 40 on stop-service failure' {
-        $content = Get-Content $ScriptPath -Raw
-        $content | Should -Match 'Failed to stop Veeam services.*exit 40'
-    }
-
-    It 'exits 50 on start-service failure' {
-        $content = Get-Content $ScriptPath -Raw
-        $content | Should -Match 'Failed to start Veeam services.*exit 50'
-    }
-
-    It 'exits 60 on re-enable failure' {
-        $content = Get-Content $ScriptPath -Raw
-        $content | Should -Match 'Failed to re-enable proxies.*exit 60'
-    }
-
-    It 'exits 3010 when reboot is pending' {
-        $content = Get-Content $ScriptPath -Raw
-        $content | Should -Match 'Reboot pending detected.*exit 3010'
-    }
-
-    It 'exits 99 on unhandled error' {
-        $content = Get-Content $ScriptPath -Raw
-        $content | Should -Match 'Unhandled error.*exit 99'
+    It 'uses ASCII source so Windows PowerShell 5.1 reads the script consistently' {
+        $bytes = [System.IO.File]::ReadAllBytes($ScriptPath)
+        @($bytes | Where-Object { $_ -gt 127 }) | Should -BeNullOrEmpty
     }
 }
 
-Describe 'sccmpatch.ps1 robustness checks' {
+Describe 'sccmpatch.ps1 SCCM exit-code contract' {
 
-    It 'sets ErrorActionPreference to Stop inside the try block' {
-        $content = Get-Content $ScriptPath -Raw
-        $content | Should -Match '\$ErrorActionPreference\s*=\s*[''"]Stop[''"]'
+    It 'returns 90 for an invalid stage before loading Veeam' {
+        Mock Write-ProxyLog {}
+        Mock Import-Module {}
+
+        $result = Invoke-ProxyMaintenance -Stage 'Invalid' -Proxies @('Proxy1') -PollDelay 1 -DrainTimeoutMinutes 1
+
+        $result | Should -Be 90
+        Should -Invoke Import-Module -Times 0
     }
 
-    It 'imports Veeam module with ErrorAction Stop' {
-        $content = Get-Content $ScriptPath -Raw
-        $content | Should -Match 'Import-Module\s+Veeam\.Backup\.PowerShell\s+-ErrorAction\s+Stop'
+    It 'returns 10 when no proxy names are supplied' {
+        Mock Write-ProxyLog {}
+        Mock Import-Module {}
+
+        $result = Invoke-ProxyMaintenance -Stage 'Pre' -Proxies @() -PollDelay 1 -DrainTimeoutMinutes 1
+
+        $result | Should -Be 10
+        Should -Invoke Import-Module -Times 0
     }
 
-    It 'checks for null task info before accessing SourceProxyId' {
-        $content = Get-Content $ScriptPath -Raw
-        $content | Should -Match '\$task\.Info\s+-and\s+\$task\.Info\.WorkDetails'
+    It 'returns 20 when disabling a proxy fails' {
+        Mock Write-ProxyLog {}
+        Mock Import-Module {}
+        Mock Get-VBRViProxy { @([pscustomobject]@{ Id = 'proxy-1'; Name = 'Proxy1' }) }
+        Mock Disable-VBRViProxy { throw 'disable failed' }
+
+        $result = Invoke-ProxyMaintenance -Stage 'Pre' -Proxies @('Proxy1') -PollDelay 1 -DrainTimeoutMinutes 1
+
+        $result | Should -Be 20
     }
 
-    It 'guards Get-VBRTaskSession pipeline against null sessions' {
-        $content = Get-Content $ScriptPath -Raw
-        $content | Should -Match 'if\s*\(\$runningSessions\)'
+    It 'returns 0 for a successful Pre stage with no active sessions' {
+        Mock Write-ProxyLog {}
+        Mock Import-Module {}
+        Mock Get-VBRViProxy { @([pscustomobject]@{ Id = 'proxy-1'; Name = 'Proxy1' }) }
+        Mock Disable-VBRViProxy {}
+        Mock Get-VBRBackupSession { @() }
+        Mock Invoke-Command {}
+
+        $result = Invoke-ProxyMaintenance -Stage 'Pre' -Proxies @('Proxy1') -PollDelay 1 -DrainTimeoutMinutes 1
+
+        $result | Should -Be 0
+        Should -Invoke Disable-VBRViProxy -Times 1
+        Should -Invoke Invoke-Command -Times 1
     }
 
-    It 'uses a proxy ID hashtable instead of per-iteration API calls' {
-        $content = Get-Content $ScriptPath -Raw
-        $content | Should -Match '\$ProxyIdSet\s*='
-        $content | Should -Match 'ProxyIdSet\.ContainsKey'
+    It 'returns 40 when stopping proxy services fails' {
+        Mock Write-ProxyLog {}
+        Mock Import-Module {}
+        Mock Get-VBRViProxy { @([pscustomobject]@{ Id = 'proxy-1'; Name = 'Proxy1' }) }
+        Mock Disable-VBRViProxy {}
+        Mock Get-VBRBackupSession { @() }
+        Mock Invoke-Command { throw 'stop failed' }
+
+        $result = Invoke-ProxyMaintenance -Stage 'Pre' -Proxies @('Proxy1') -PollDelay 1 -DrainTimeoutMinutes 1
+
+        $result | Should -Be 40
+    }
+
+    It 'returns 50 when starting proxy services fails' {
+        Mock Write-ProxyLog {}
+        Mock Import-Module {}
+        Mock Get-VBRViProxy { @([pscustomobject]@{ Id = 'proxy-1'; Name = 'Proxy1' }) }
+        Mock Invoke-Command { throw 'start failed' }
+
+        $result = Invoke-ProxyMaintenance -Stage 'Post' -Proxies @('Proxy1') -PollDelay 1 -DrainTimeoutMinutes 1
+
+        $result | Should -Be 50
+    }
+
+    It 'returns 60 when re-enabling proxies fails' {
+        Mock Write-ProxyLog {}
+        Mock Import-Module {}
+        Mock Get-VBRViProxy { @([pscustomobject]@{ Id = 'proxy-1'; Name = 'Proxy1' }) }
+        Mock Invoke-Command {}
+        Mock Enable-VBRViProxy { throw 'enable failed' }
+
+        $result = Invoke-ProxyMaintenance -Stage 'Post' -Proxies @('Proxy1') -PollDelay 1 -DrainTimeoutMinutes 1
+
+        $result | Should -Be 60
+    }
+
+    It 'returns 99 when the Veeam module cannot load' {
+        Mock Write-ProxyLog {}
+        Mock Import-Module { throw 'module missing' }
+
+        $result = Invoke-ProxyMaintenance -Stage 'Pre' -Proxies @('Proxy1') -PollDelay 1 -DrainTimeoutMinutes 1
+
+        $result | Should -Be 99
+    }
+
+    It 'supports WhatIf without loading Veeam' {
+        Mock Write-ProxyLog {}
+        Mock Import-Module {}
+
+        $result = Invoke-ProxyMaintenance -Stage 'Pre' -Proxies @('Proxy1') -PollDelay 1 -DrainTimeoutMinutes 1 -WhatIf
+
+        $result | Should -Be 0
+        Should -Invoke Import-Module -Times 0
+    }
+
+    It 'returns 30 when a targeted task remains past the drain timeout' {
+        Mock Write-ProxyLog {}
+        $script:DrainTestTime = [datetime]'2026-01-01T00:00:00'
+        Mock Get-Date { $script:DrainTestTime }
+        Mock Start-Sleep { $script:DrainTestTime = $script:DrainTestTime.AddMinutes(1) }
+        Mock Get-VBRBackupSession { @([pscustomobject]@{ State = 'Working' }) }
+        Mock Get-VBRTaskSession {
+            @([pscustomobject]@{
+                Status = 'InProgress'
+                Name = 'Backup task'
+                Info = [pscustomobject]@{
+                    WorkDetails = [pscustomobject]@{ SourceProxyId = 'proxy-1' }
+                }
+            })
+        }
+        Mock Get-VBRViProxy { @([pscustomobject]@{ Id = 'proxy-1'; Name = 'Proxy1' }) }
+
+        $result = $null
+        try {
+            Wait-ProxyTasksToDrain -ProxyObjects @([pscustomobject]@{ Id = 'proxy-1'; Name = 'Proxy1' }) -PollDelay 1 -DrainTimeoutMinutes 1
+        }
+        catch [System.TimeoutException] {
+            $result = 30
+        }
+
+        $result | Should -Be 30
+    }
+
+    It 'ignores active tasks that use an unselected proxy' {
+        Mock Write-ProxyLog {}
+        Mock Start-Sleep {}
+        Mock Get-VBRBackupSession { @([pscustomobject]@{ State = 'Working' }) }
+        Mock Get-VBRTaskSession {
+            @([pscustomobject]@{
+                Status = 'InProgress'
+                Name = 'Other proxy task'
+                Info = [pscustomobject]@{
+                    WorkDetails = [pscustomobject]@{ SourceProxyId = 'other-proxy' }
+                }
+            })
+        }
+
+        { Wait-ProxyTasksToDrain -ProxyObjects @([pscustomobject]@{ Id = 'proxy-1'; Name = 'Proxy1' }) -PollDelay 1 -DrainTimeoutMinutes 1 } |
+            Should -Not -Throw
+        Should -Invoke Start-Sleep -Times 0
     }
 }
 
-Describe 'Write-ProxyLog function' {
+Describe 'sccmpatch.ps1 Post stage' {
 
-    It 'is defined in the script' {
-        $ast = Get-ScriptAst
-        $func = $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $args[0].Name -eq 'Write-ProxyLog' }, $true)
-        $func | Should -Not -BeNullOrEmpty
-    }
+    It 'starts services, re-enables proxies, and returns 3010 for a pending reboot' {
+        Mock Write-ProxyLog {}
+        Mock Import-Module {}
+        Mock Get-VBRViProxy { @([pscustomobject]@{ Id = 'proxy-1'; Name = 'Proxy1' }) }
+        Mock Invoke-Command {}
+        Mock Enable-VBRViProxy {}
+        Mock Test-Path { $true }
 
-    It 'accepts Msg, Level, and ToConsole parameters' {
-        $ast = Get-ScriptAst
-        $func = $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $args[0].Name -eq 'Write-ProxyLog' }, $true)
-        $paramNames = $func[0].Body.ParamBlock.Parameters.Name.VariablePath.UserPath
-        $paramNames | Should -Contain 'Msg'
-        $paramNames | Should -Contain 'Level'
-        $paramNames | Should -Contain 'ToConsole'
-    }
+        $result = Invoke-ProxyMaintenance -Stage 'Post' -Proxies @('Proxy1') -PollDelay 1 -DrainTimeoutMinutes 1
 
-    It 'defaults Level to INFO' {
-        $ast = Get-ScriptAst
-        $func = $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $args[0].Name -eq 'Write-ProxyLog' }, $true)
-        $levelParam = $func[0].Body.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq 'Level' }
-        $levelParam.DefaultValue.Value | Should -Be 'INFO'
+        $result | Should -Be 3010
+        Should -Invoke Invoke-Command -Times 1
+        Should -Invoke Enable-VBRViProxy -Times 1
     }
 }
