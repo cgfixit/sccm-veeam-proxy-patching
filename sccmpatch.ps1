@@ -79,6 +79,7 @@ function Wait-ProxyTasksToDrain {
         }
     }
 
+    $timeoutSeconds = $DrainTimeoutMinutes * 60
     $startTime = Get-Date
     do {
         $runningSessions = @(
@@ -111,16 +112,21 @@ function Wait-ProxyTasksToDrain {
                 $proxyIdSet[$busyTask.Info.WorkDetails.SourceProxyId], $busyTask.Name
             ) 'WARN' -ToConsole
 
-            if (((Get-Date) - $startTime).TotalMinutes -ge $DrainTimeoutMinutes) {
+            $elapsedSeconds = ((Get-Date) - $startTime).TotalSeconds
+            if ($elapsedSeconds -ge $timeoutSeconds) {
                 throw [System.TimeoutException]::new(
                     ('Task drain timeout after {0} minutes.' -f $DrainTimeoutMinutes)
                 )
             }
 
+            $sleepSeconds = [int][Math]::Min(
+                $PollDelay,
+                [Math]::Ceiling($timeoutSeconds - $elapsedSeconds)
+            )
             Write-ProxyLog (
-                '{0} active task(s) remain; sleeping {1}s.' -f $runningTasks.Count, $PollDelay
+                '{0} active task(s) remain; sleeping {1}s.' -f $runningTasks.Count, $sleepSeconds
             ) -ToConsole
-            Start-Sleep -Seconds $PollDelay
+            Start-Sleep -Seconds $sleepSeconds
         }
     } while ($busyTask)
 

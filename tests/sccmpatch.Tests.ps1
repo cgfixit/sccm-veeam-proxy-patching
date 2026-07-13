@@ -161,8 +161,13 @@ Describe 'sccmpatch.ps1 SCCM exit-code contract' {
     It 'returns 30 when a targeted task remains past the drain timeout' {
         Mock Write-ProxyLog {}
         $script:DrainTestTime = [datetime]'2026-01-01T00:00:00'
+        $script:DrainSleepSeconds = $null
         Mock Get-Date { $script:DrainTestTime }
-        Mock Start-Sleep { $script:DrainTestTime = $script:DrainTestTime.AddMinutes(1) }
+        Mock Start-Sleep {
+            param($Seconds)
+            $script:DrainSleepSeconds = $Seconds
+            $script:DrainTestTime = $script:DrainTestTime.AddMinutes(1)
+        }
         Mock Get-VBRBackupSession { @([pscustomobject]@{ State = 'Working' }) }
         Mock Get-VBRTaskSession {
             @([pscustomobject]@{
@@ -177,13 +182,15 @@ Describe 'sccmpatch.ps1 SCCM exit-code contract' {
 
         $result = $null
         try {
-            Wait-ProxyTasksToDrain -ProxyObjects @([pscustomobject]@{ Id = 'proxy-1'; Name = 'Proxy1' }) -PollDelay 1 -DrainTimeoutMinutes 1
+            Wait-ProxyTasksToDrain -ProxyObjects @([pscustomobject]@{ Id = 'proxy-1'; Name = 'Proxy1' }) -PollDelay 120 -DrainTimeoutMinutes 1
         }
         catch [System.TimeoutException] {
             $result = 30
         }
 
         $result | Should -Be 30
+        $script:DrainSleepSeconds | Should -Be 60
+        Should -Invoke Start-Sleep -Times 1
     }
 
     It 'ignores active tasks that use an unselected proxy' {
