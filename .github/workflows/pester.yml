@@ -5,7 +5,7 @@ on:
     branches: ["main"]
   pull_request:
     branches: ["main"]
-  workflow_dispatch:
+  workflow_dispatch: {}
 
 concurrency:
   group: pester-${{ github.workflow }}-${{ github.ref }}
@@ -15,27 +15,16 @@ permissions:
   contents: read
 
 jobs:
-  test:
-    name: Pester (${{ matrix.name }})
-    runs-on: ${{ matrix.os }}
+  pwsh:
+    name: Pester (pwsh)
+    runs-on: ubuntu-latest
     timeout-minutes: 10
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: pwsh
-            os: ubuntu-latest
-            shell: pwsh
-          - name: windows-powershell
-            os: windows-latest
-            shell: powershell
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Validate PowerShell parser
-        shell: ${{ matrix.shell }}
+        shell: pwsh
         run: |
           $errors = $null
           $null = [System.Management.Automation.Language.Parser]::ParseFile(
@@ -47,7 +36,7 @@ jobs:
           }
 
       - name: Ensure Pester 5 is available
-        shell: ${{ matrix.shell }}
+        shell: pwsh
         run: |
           $pester = Get-Module -ListAvailable -Name Pester |
               Where-Object { $_.Version.Major -ge 5 } |
@@ -58,13 +47,13 @@ jobs:
           }
 
       - name: Run Pester tests
-        shell: ${{ matrix.shell }}
+        shell: pwsh
         run: |
           $config = New-PesterConfiguration
           $config.Run.Path = './tests'
           $config.Output.Verbosity = 'Detailed'
           $config.TestResult.Enabled = $true
-          $config.TestResult.OutputPath = 'testResults-${{ matrix.name }}.xml'
+          $config.TestResult.OutputPath = 'testResults-pwsh.xml'
           $config.TestResult.OutputFormat = 'NUnitXml'
           Invoke-Pester -Configuration $config
 
@@ -72,6 +61,56 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pester-results-${{ matrix.name }}
-          path: testResults-${{ matrix.name }}.xml
+          name: pester-results-pwsh
+          path: testResults-pwsh.xml
+          if-no-files-found: warn
+
+  windows-powershell:
+    name: Pester (Windows PowerShell 5.1)
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate PowerShell parser
+        shell: powershell
+        run: |
+          $errors = $null
+          $null = [System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path './sccmpatch.ps1'), [ref]$null, [ref]$errors
+          )
+          if ($errors) {
+              $errors | Format-List
+              exit 1
+          }
+
+      - name: Ensure Pester 5 is available
+        shell: powershell
+        run: |
+          $pester = Get-Module -ListAvailable -Name Pester |
+              Where-Object { $_.Version.Major -ge 5 } |
+              Sort-Object Version -Descending |
+              Select-Object -First 1
+          if (-not $pester) {
+              Install-Module -Name Pester -MinimumVersion 5.0.0 -Scope CurrentUser -Force -SkipPublisherCheck
+          }
+
+      - name: Run Pester tests
+        shell: powershell
+        run: |
+          $config = New-PesterConfiguration
+          $config.Run.Path = './tests'
+          $config.Output.Verbosity = 'Detailed'
+          $config.TestResult.Enabled = $true
+          $config.TestResult.OutputPath = 'testResults-windows-powershell.xml'
+          $config.TestResult.OutputFormat = 'NUnitXml'
+          Invoke-Pester -Configuration $config
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pester-results-windows-powershell
+          path: testResults-windows-powershell.xml
           if-no-files-found: warn
