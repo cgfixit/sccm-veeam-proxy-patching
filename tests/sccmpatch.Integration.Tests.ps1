@@ -1,5 +1,4 @@
 BeforeAll {
-    $ScriptPath = (Resolve-Path (Join-Path -Path $PSScriptRoot -ChildPath '..\sccmpatch.ps1')).Path
     $PowerShellCommand = Get-Command pwsh -ErrorAction SilentlyContinue
     if (-not $PowerShellCommand) {
         $PowerShellCommand = Get-Command powershell.exe -ErrorAction SilentlyContinue
@@ -9,6 +8,7 @@ BeforeAll {
 Describe 'sccmpatch.ps1 process entrypoint' {
 
     It 'returns SCCM code 90 for an invalid stage without loading Veeam' {
+        $scriptPath = (Resolve-Path (Join-Path -Path $PSScriptRoot -ChildPath '..\sccmpatch.ps1')).Path
         $arguments = @(
             '-NoLogo'
             '-NoProfile'
@@ -16,7 +16,7 @@ Describe 'sccmpatch.ps1 process entrypoint' {
             '-ExecutionPolicy'
             'Bypass'
             '-File'
-            $ScriptPath
+            $scriptPath
             '-Stage'
             'Invalid'
             '-Proxies'

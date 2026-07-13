@@ -162,6 +162,7 @@ function Invoke-ProxyServiceAction {
 
 function Invoke-ProxyMaintenance {
     [CmdletBinding(SupportsShouldProcess)]
+    [OutputType([int])]
     param(
         [Parameter(Mandatory)]
         [string]$Stage,
