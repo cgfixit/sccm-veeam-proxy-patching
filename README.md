@@ -4,7 +4,7 @@
 ---
 
 ## Overview
-This PowerShell script automates safe maintenance windows for Veeam Backup & Replication VMware proxies in SCCM/ConfigMgr-driven patching workflows. It is intended to run on the **Veeam Backup & Replication server** or a **management/jump host** with the Veeam Console installed, and it remotely orchestrates VMware proxies via Veeam PowerShell and WinRM.
+This PowerShell script automates (minor config changes needed - see comments in ps1 script) safe maintenance windows for Veeam Backup & Replication VMware proxies in SCCM/ConfigMgr-driven patching workflows. It is intended to run on the **Veeam Backup & Replication server** or a **management/jump host** with the Veeam Console installed, and it remotely orchestrates VMware proxies via Veeam PowerShell and WinRM.
 
 The script implements a two-stage process—**Pre** (quiesce) and **Post** (recovery)—that ensures no backup tasks using the selected proxies are interrupted while their Veeam services are stopped and restarted during maintenance of the VBR server or management host.
 
