@@ -51,6 +51,7 @@ jobs:
         run: |
           $config = New-PesterConfiguration
           $config.Run.Path = './tests'
+          $config.Run.Exit = $true
           $config.Output.Verbosity = 'Detailed'
           $config.TestResult.Enabled = $true
           $config.TestResult.OutputPath = 'testResults-pwsh.xml'
@@ -66,7 +67,11 @@ jobs:
           if-no-files-found: warn
 
   windows-powershell:
-    name: Pester (Windows PowerShell 5.1)
+    strategy:
+      fail-fast: false
+      matrix:
+        shell: [powershell, pwsh]
+    name: Pester (Windows ${{ matrix.shell }})
     runs-on: windows-latest
     timeout-minutes: 10
     steps:
@@ -74,7 +79,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Validate PowerShell parser
-        shell: powershell
+        shell: ${{ matrix.shell }}
         run: |
           $errors = $null
           $null = [System.Management.Automation.Language.Parser]::ParseFile(
@@ -86,7 +91,7 @@ jobs:
           }
 
       - name: Ensure Pester 5 is available
-        shell: powershell
+        shell: ${{ matrix.shell }}
         run: |
           $pester = Get-Module -ListAvailable -Name Pester |
               Where-Object { $_.Version.Major -ge 5 } |
@@ -97,13 +102,14 @@ jobs:
           }
 
       - name: Run Pester tests
-        shell: powershell
+        shell: ${{ matrix.shell }}
         run: |
           $config = New-PesterConfiguration
           $config.Run.Path = './tests'
+          $config.Run.Exit = $true
           $config.Output.Verbosity = 'Detailed'
           $config.TestResult.Enabled = $true
-          $config.TestResult.OutputPath = 'testResults-windows-powershell.xml'
+          $config.TestResult.OutputPath = 'testResults-windows-${{ matrix.shell }}.xml'
           $config.TestResult.OutputFormat = 'NUnitXml'
           Invoke-Pester -Configuration $config
 
@@ -111,6 +117,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pester-results-windows-powershell
-          path: testResults-windows-powershell.xml
+          name: pester-results-windows-${{ matrix.shell }}
+          path: testResults-windows-${{ matrix.shell }}.xml
           if-no-files-found: warn

@@ -1,166 +1,116 @@
-# Veeam Proxy Maintenance for SCCM Patching
-**Gracefully drain selected VMware proxies, stop Veeam services for patching/reboot, and return them to production without disrupting active backup jobs.**
+# Veeam proxy maintenance for SCCM patching
 
----
+`sccmpatch.ps1` coordinates maintenance of selected Windows VMware backup proxies from a Windows Veeam Backup & Replication server or a Windows management host with the matching Veeam Console installed.
 
-## Overview
-This PowerShell script automates (minor config changes needed - see comments in ps1 script) safe maintenance windows for Veeam Backup & Replication VMware proxies in SCCM/ConfigMgr-driven patching workflows. It is intended to run on the **Veeam Backup & Replication server** or a **management/jump host** with the Veeam Console installed, and it remotely orchestrates VMware proxies via Veeam PowerShell and WinRM.
+`Pre` disables the selected proxies, waits for their active backup tasks to drain, then stops their Veeam services over WinRM. `Post` starts those services, re-enables the proxies, and returns `3010` if the **script host** has a pending reboot. The SCCM task sequence patches the script host; service operations target the proxy names you supply.
 
-The script implements a two-stage process—**Pre** (quiesce) and **Post** (recovery)—that ensures no backup tasks using the selected proxies are interrupted while their Veeam services are stopped and restarted during maintenance of the VBR server or management host.
+## VBR detection and PowerShell requirements
 
-## Why This Matters
-Abruptly stopping Veeam services for Windows patching can:
-*   Interrupt active backup jobs mid-stream
-*   Corrupt backup repositories
-*   Trigger customer SLA violations
-*   Leave infrastructure in inconsistent states
+The script identifies the local Veeam Server or Console release from Windows installed-product records. It reads `DisplayName` and `DisplayVersion` under the native 64-bit `HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall` key. Only the exact `Veeam Backup & Replication Server` and `Veeam Backup & Replication Console` product names qualify. The generic installer bundle is also used by Enterprise Manager and does not establish a backup-server installation. The presence of `powershell.exe` or `pwsh.exe` is not used to infer the VBR version.
 
-This script prevents those issues by polling active backup sessions, gracefully disabling selected proxies in VBR, draining in-flight tasks that are using those proxies, and only then stopping Veeam services on the proxies via WinRM for safe maintenance of the central VBR/management server.
+| Installed Veeam release | Required host |
+| --- | --- |
+| VBR 12, starting at 12.3.2 | 64-bit Windows PowerShell 5.1, Desktop edition |
+| VBR 13.0 | 64-bit PowerShell 7, Core edition, meeting the installed module's declared minimum |
+| VBR 13.1 | 64-bit PowerShell 7.6.3 or later, Core edition, meeting the installed module's declared minimum |
 
-## Features
-*   **Parameterized proxy targeting**: Run against any proxy or batch of proxies without editing code
-*   **Intelligent task draining**: Polls active Veeam backup sessions and waits for tasks using the targeted proxies to complete (with configurable timeout)
-*   **Persistent logging**: All actions logged to a timestamped file for SCCM integration and audit trails
-*   **SCCM-aware exit codes**: Returns standard ConfigMgr codes (0, 3010) plus detailed diagnostics (10–99) for troubleshooting
-*   **Reboot signaling**: Detects Windows pending reboots **on the machine running the script** (VBR server or management host) and returns exit code 3010 so SCCM handles restart orchestration
-*   **Two-stage orchestration**: Designed for SCCM task sequences (Pre → Windows Updates → Post) that run on the VBR server or management/jump host, while coordinating remote proxies
+The script also checks the selected module's `PowerShellVersion` and `CompatiblePSEditions` before importing it. The table describes the script's compatibility gates. Use the PowerShell build supported by Veeam for your installed VBR release; satisfying a manifest minimum does not certify every later PowerShell release.
 
-## Requirements
+The [VBR 12.3.2 archive](https://helpcenter.veeam.com/archive/backup/120/powershell/getting_started.html) requires Windows PowerShell 5.1. The [VBR 13 global changes](https://helpcenter.veeam.com/docs/vbr/powershell/global_changes_v13.html) require PowerShell 7. The [current Windows instructions](https://helpcenter.veeam.com/docs/vbr/powershell/running_ps_sessions_windows.html?ver=13), checked on October 3, 2026, apply to VBR 13.1.1.18 and specify PowerShell 7.6.3. Do not apply a historical 13.0 PowerShell build requirement to all of VBR 13.
 
-### Veeam Environment
-*   **Veeam Backup & Replication 12.3.2+** (Server & Console) on the system where the script runs
-*   VMware proxies must be registered and functional in VBR
-*   Account running the script must have the **Backup Administrator** role (or equivalent) in VBR
+After import, the script connects to `-VBRServer` under the current Windows identity and reads the actual backup server version with [`Get-VBRBackupServerInfo`](https://helpcenter.veeam.com/docs/vbr/powershell/get-vbrbackupserverinfo.html). The local installed release and connected server build are logged separately. Their major, minor, and build components must match. Windows Installer metadata may not reflect a hotfix revision, so the script leaves revision compatibility to Veeam's connection checks. The Console must match the server as described in [Veeam's Console requirements](https://helpcenter.veeam.com/docs/vbr/userguide/console_install_before_you_begin.html).
 
-### Target Proxies
-*   **WinRM enabled** (for remote service management from the script host)
-*   **Local Administrator access** on the proxies for the account running the script
-*   Network connectivity from the script host to the VBR server (if separate) and to all target proxies
+Missing, malformed, ambiguous, unsupported, or mismatched version evidence returns `99` before proxy lookup or service operations. An incompatible shell also returns `99` with the required executable and version. The script does not install PowerShell or relaunch itself. Configure SCCM with the correct executable below. Versions older than 12.3.2, VBR 13.2 or later, and future major versions require an explicit compatibility update.
 
-### PowerShell & Account
-*   PowerShell 5.1+ on the VBR server or jump host where the script executes
-*   Execution Policy: `RemoteSigned` or `Bypass` for script execution
-*   MFA disabled for the service account (Veeam PowerShell sessions do not support MFA per KB4535)
+A [Veeam installation report and product-team response](https://forums.veeam.com/viewtopic.php?f=2&start=30&t=100568) demonstrate why this distinction matters: the Server and Console MSI records remained at 12.3.2.3617 after a patch, while `Get-VBRBackupServerInfo` reported 12.3.2.4165.
 
-## Installation
-1.  Download `sccmpatch.ps1` to your VBR server or management/jump host, or to an SCCM distribution point used to target that host.
-2.  Ensure the **Veeam PowerShell module** is available on the host running the script (installed with the Veeam Console).
-3.  Store the script in a shared location accessible to the SCCM client context on the VBR/management host (e.g., `C:\Scripts\` or a network UNC path).
+The installed-product lookup uses [Windows Installer metadata](https://learn.microsoft.com/en-us/windows/win32/msi/uninstall-registry-key). It identifies the local release, including Console-only installations; it is not a remote server query or a guarantee of the exact patched binary version.
+
+## Prerequisites
+
+- Run in a fresh, 64-bit Windows PowerShell process with no existing Veeam server session. The script refuses to take over an existing session.
+- Install the Veeam Console and its PowerShell module on the management host. Keep it compatible with the intended backup server.
+- Supply `-VBRServer` on a Console-only host. A local Server installation can use the default `localhost` target.
+- Use a Veeam Backup Administrator account with local administrator rights on the selected Windows proxies. Veeam PowerShell does not support MFA. See [KB4535](https://www.veeam.com/kb4535) and [SECURITY.md](SECURITY.md).
+- Enable WinRM and allow connectivity from the script host to each target proxy. Configure Kerberos or HTTPS according to your environment.
+- Use an execution policy that permits the script, such as `RemoteSigned` or `AllSigned`.
+
+A Windows Console can connect to a VBR 13 Linux backup server. The SCCM host and the proxies whose Windows services this script manages must still be Windows machines. This script does not patch a Linux appliance or manage Linux proxy services.
 
 ## Usage
 
-### Basic Examples
-**Pre-stage** for proxies "Proxy1" and "Proxy2":
-```powershell  
-.\Sccmpatch.ps1 -Stage Pre -Proxies 'Proxy1','Proxy2'  
-Post-stage after patching:
-powershell
-.\Sccmpatch.ps1 -Stage Post -Proxies 'Proxy1','Proxy2'
-Custom drain timeout (60 minutes):
-powershell
-.\Sccmpatch.ps1 -Stage Pre -Proxies 'Proxy1','Proxy2' -DrainTimeoutMinutes 60
-Parameters
-Table
-Parameter	Type	Default	Description
--Stage	string	Pre	Execution stage: Pre (disable/drain/stop) or Post (start/re-enable/reboot signal). Invalid values return code 90.
--Proxies	string[]	@('Proxy1','Proxy2')	Array of proxy hostnames (as known to VBR) to target. Override with your environment names.
--PollDelay	int	30	Seconds between task-drain polls. Must be at least 1. Lower = faster detection, higher = less VBR API chatter.
--DrainTimeoutMinutes	int	30	Maximum wait time for active tasks using the targeted proxies to complete. Must be at least 1. If exceeded, exits with code 30.
-Exit Codes
-Table
-Code	Stage	Meaning	Action in SCCM
-0	Both	Success, no reboot	Continue to next step
-3010	Post	Success, reboot pending on script host	Schedule/execute reboot per ConfigMgr policy for the VBR/management host
-10	Both	Proxy objects not found	Failure – verify proxy names in VBR
-20	Pre	Disable failed	Failure – check VBR permissions/connectivity
-30	Pre	Task-drain timeout	Failure – jobs still active after timeout; increase -DrainTimeoutMinutes
-40	Pre	Service stop failed	Failure – check WinRM/remote access to proxy
-50	Post	Service start failed	Failure – check proxy connectivity/service status
-60	Post	Re-enable failed	Failure – critical; proxy may remain disabled
-90	Both	Invalid Stage argument	Usage error – use -Stage Pre or -Stage Post
-99	Both	Unhandled error	Failure – check log file for details
-Integration with SCCM Task Sequences
-Recommended Task Sequence Structure
-This example assumes the task sequence targets the VBR server or management/jump host where the Veeam Console and Sccmpatch.ps1 are installed. The script will coordinate remote proxies during the maintenance of that host.
-1.	"Disable Veeam Proxies" (Run PowerShell Script step)
-o	Command: powershell.exe -ExecutionPolicy Bypass -File Sccmpatch.ps1 -Stage Pre -Proxies 'Proxy1','Proxy2'
-o	Success codes: 0
-o	Continue on error: No (halt if Pre stage fails)
-2.	"Install Software Updates" (Install Software Updates step)
-o	Runs Windows Update, patches the VBR/management host, and may stage a reboot.
-3.	"Re-enable Veeam Proxies" (Run PowerShell Script step)
-o	Command: powershell.exe -ExecutionPolicy Bypass -File Sccmpatch.ps1 -Stage Post -Proxies 'Proxy1','Proxy2'
-o	Success codes: 0 3010
-o	Continue on error: No
-4.	"Restart Computer" (Restart Computer step)
-o	Automatically triggered if any prior step returned 3010 (reboot pending on the VBR/management host).
-SCCM Deployment Type (for Applications)
-If deploying as a standalone application package to the VBR server or management host:
-1.	Create a new Application with deployment type "Script Installer".
-2.	Set installation script: point to Sccmpatch.ps1 with -Stage Pre and appropriate -Proxies.
-3.	On the Return Codes tab, add:
-o	0 = Success
-o	10, 20, 30, 40, 90, 99 = Failure
-o	3010 = SoftReboot (if planning to use Post stage separately in another deployment or TS)
-Logging
-Log File Location
-•	%TEMP%\ProxyMaintenance_yyyyMMdd-HHmmss.log
-•	Example path (running as SYSTEM): C:\Users\SYSTEM\AppData\Local\Temp\ProxyMaintenance_20250924-143022.log
-Log Format
-text
-2025-09-24 14:30:22 [INFO] Process begins (Stage: Pre, Proxies: Proxy1, Proxy2)
-2025-09-24 14:30:23 [INFO] >>> Waiting for active tasks to drain…
-2025-09-24 14:30:54 [WARN] Task still active on proxy Proxy1: Backup Job - VM-Server01
-2025-09-24 14:31:24 [INFO] >>> No active tasks – stopping services.
-2025-09-24 14:31:25 [INFO] Stopping Veeam services on Proxy1 …
-2025-09-24 14:31:28 [INFO] Stage Pre completed successfully
-Note: Log files in %TEMP% may be cleaned by Windows; for production audits, consider redirecting logs to a persistent path (e.g., a network share or central logging solution) or integrating with Event Viewer.
-Troubleshooting
-Task Drain Timeout (Exit Code 30)
-Symptom: Script times out waiting for active backup tasks using the targeted proxies to finish.
-•	Causes: Long-running backup jobs, Instant Recovery sessions, or job queue backlogs.
-•	Solutions:
-o	Increase -DrainTimeoutMinutes to 60+ for large job queues.
-o	Manually pause/suspend jobs feeding these proxies before running Pre stage:
-Get-VBRJob | Where-Object { $_.TargetProxy -like 'Proxy1*' } | Suspend-VBRJob
-o	Check for Instant Recovery sessions in VBR Console that may be using proxy resources.
-Service Stop Failure (Exit Code 40)
-Symptom: Script fails to stop Veeam services on a proxy.
-•	Causes: WinRM not enabled, Firewall blocking WinRM, or insufficient permissions.
-•	Solutions:
-o	Verify WinRM is enabled: Invoke-Command -ComputerName 'Proxy1' -ScriptBlock { Get-Service WinRM | Select Status }
-o	Verify network connectivity and firewall rules allow WinRM (TCP 5985/5986).
-o	Confirm account has local admin rights on proxy.
-Re-enable Failure (Exit Code 60)
-Symptom: Proxies remain disabled in VBR after Post stage.
-•	Causes: VBR server connectivity lost or insufficient VBR permissions.
-•	Solutions:
-o	Test VBR connectivity: Get-VBRServer | Select Name, State
-o	Manually re-enable proxy in VBR Console: Home → Infrastructure → Backup Infrastructure → Proxies.
-Performance & Sizing
-•	Drain poll interval: Default 30 seconds (adjustable via -PollDelay).
-o	For environments with <10 concurrent jobs: 30s is sufficient.
-o	For large job queues: consider -PollDelay 60 to reduce VBR API load.
-•	Drain timeout: Default 30 minutes (adjustable via -DrainTimeoutMinutes).
-o	Small deployments (1–5 proxies, <50 daily jobs): 30 min is typically adequate.
-o	Large deployments (>10 proxies, >100 daily jobs): increase to 60+ min.
-Contributing
-Found a bug or have a feature request? Please open an issue or submit a pull request. Suggested improvements:
-•	Support for Hyper-V proxies
-•	Event Viewer logging integration
-•	Automatic job suspension logic
-•	Multi-proxy parallel draining
-Disclaimer
-This script interacts with critical backup infrastructure. Test thoroughly in a non-production environment first. Ensure you have backups of your Veeam configuration and a rollback plan before running in production. The author assumes no liability for data loss, service disruption, or other damages resulting from script execution.
-Quick Start Checklist
-•	 Download script to VBR server or management/jump host (or SCCM distribution point targeting that host)
-•	 Verify Veeam PowerShell module is installed (via Veeam Console) on that host
-•	 Confirm account running the script has Backup Administrator role in VBR
-•	 Confirm account has local admin on all target proxies
-•	 Enable WinRM on all target proxies
-•	 Test Pre stage on one proxy: .\Sccmpatch.ps1 -Stage Pre -Proxies 'TestProxy'
-•	 Review log file output
-•	 Test Post stage: .\Sccmpatch.ps1 -Stage Post -Proxies 'TestProxy'
-•	 Integrate into SCCM task sequence targeting the VBR/management host with proper success codes
-•	 Deploy to production with change management approval
+Copy `sccmpatch.ps1` to the VBR server or management host, such as `C:\Scripts`. Run it in the required shell, with your actual proxy names and backup server target.
 
+```powershell
+.\sccmpatch.ps1 -Stage Pre -Proxies 'Proxy1','Proxy2' -VBRServer 'VBRServer'
+.\sccmpatch.ps1 -Stage Post -Proxies 'Proxy1','Proxy2' -VBRServer 'VBRServer'
+.\sccmpatch.ps1 -Stage Pre -Proxies 'Proxy1','Proxy2' -DrainTimeoutMinutes 60 -VBRServer 'VBRServer'
+```
+
+`-WhatIf` returns before installation discovery, Veeam module import, connection, or remote operations. It previews the requested maintenance action; it does **not** validate prerequisites or query current backup activity.
+
+```powershell
+.\sccmpatch.ps1 -Stage Pre -Proxies 'Proxy1','Proxy2' -WhatIf
+```
+
+| Parameter | Default | Purpose |
+| --- | --- | --- |
+| `-Stage` | `Pre` | `Pre` or `Post`. Other values return `90`. |
+| `-Proxies` | The two example names in the script | Windows proxy names as registered in VBR. Always override these for your environment. |
+| `-VBRServer` | Local server when installed | Explicit backup server name. Required on a Console-only host. |
+| `-PollDelay` | `30` | Seconds between drain polls, from 1 through 3600. |
+| `-DrainTimeoutMinutes` | `30` | Maximum drain duration, from 1 through 1440 minutes. |
+
+## SCCM task sequence
+
+Use a **Run Command Line** step with the matching shell. These examples construct the proxy array inside PowerShell because native `-File` argument passing does not reliably preserve a multi-element array in Windows PowerShell 5.1. Keep `exit $LASTEXITCODE` to propagate the script's SCCM code from `-Command`.
+
+VBR 12.3.2, from a 64-bit SCCM step:
+
+```text
+powershell.exe -NoLogo -NoProfile -NonInteractive -Command "& 'C:\Scripts\sccmpatch.ps1' -Stage Pre -Proxies @('Proxy1','Proxy2') -VBRServer 'VBRServer'; exit $LASTEXITCODE"
+```
+
+VBR 13, using a supported PowerShell 7 installation:
+
+```text
+"C:\Program Files\PowerShell\7\pwsh.exe" -NoLogo -NoProfile -NonInteractive -Command "& 'C:\Scripts\sccmpatch.ps1' -Stage Pre -Proxies @('Proxy1','Proxy2') -VBRServer 'VBRServer'; exit $LASTEXITCODE"
+```
+
+Use this sequence:
+
+1. Run `Pre`. Accept only `0`, and stop the sequence on failure.
+2. Install the approved Windows updates on the VBR or management host.
+3. Run the same version-appropriate command with `-Stage Post`. Accept `0` and `3010`.
+4. Let ConfigMgr's restart policy handle `3010` for the script host.
+
+Disable the task-sequence option to run as a 32-bit process. The startup check rejects 32-bit hosts. For an Application deployment type, configure the return-code mappings below and provide a separate Post recovery step.
+
+| Code | Meaning | SCCM action |
+| --- | --- | --- |
+| `0` | Success | Continue |
+| `3010` | Post succeeded; script host has a pending reboot | Soft reboot |
+| `10` | Empty proxy list or no matching proxy objects | Fail and verify names |
+| `20` | Pre failed to disable proxies | Fail and inspect VBR permissions and connectivity |
+| `30` | Pre task-drain timeout | Fail; inspect active work and timeout |
+| `40` | Pre failed to stop proxy services | Fail and inspect WinRM or service access |
+| `50` | Post failed to start proxy services | Fail and inspect proxy service health |
+| `60` | Post failed to re-enable proxies | Fail; restore proxy availability manually if needed |
+| `90` | Invalid Stage | Fail and correct the command |
+| `99` | Startup/version/module/connection failure or unhandled error | Fail and inspect the log |
+
+A Pre failure after proxy disable can leave proxies disabled. Inspect the log and recover through Post or the Veeam Console when the cause is resolved.
+
+## Logs and troubleshooting
+
+Logs are written to `%TEMP%\ProxyMaintenance_yyyyMMdd-HHmmss.log` in the account running the script. They record the local Veeam installation, PowerShell host, connected server build, stage, and operation failures. Retain these files with your SCCM deployment evidence; temporary files may be cleaned by Windows.
+
+For `99`, check the logged installed version and required PowerShell executable first. Confirm the Console and server releases match, that `-VBRServer` names the intended server, and that a single Veeam module installation is discoverable. Start a fresh shell if a Veeam session already exists. Repair missing or conflicting product records instead of guessing a version. Complete any Veeam certificate trust setup through the supported administrative process; the script does not force certificate acceptance.
+
+For `30`, inspect the selected proxies' active work in Veeam before increasing the timeout. The default poll interval is 30 seconds and the default timeout is 30 minutes. For `40` or `50`, inspect WinRM and the `Veeam*` services on the named proxies. For `60`, inspect server connectivity and re-enable the proxies in the Console after services are healthy.
+
+## Validation and limitations
+
+The tests execute the script with isolated Windows installation, PowerShell host, Veeam, and WinRM doubles. They cover version decisions, refusal before mutation, ordering, and SCCM return values. CI runs on PowerShell 7 and Windows PowerShell 5.1. These checks do not load real Veeam assemblies or perform live proxy maintenance.
+
+The existing drain algorithm uses `task.Info.WorkDetails.SourceProxyId`. Veeam's public PowerShell reference does not document that internal property. The exact VBR 13 Windows installer records have not been verified against a live installation. Validate task-to-proxy matching on your VBR build before production use, along with registry metadata, module loading, service behavior, and Windows process exit `3010`. Test a complete Pre/Post cycle in a non-production environment and retain a recovery plan.
