@@ -21,14 +21,15 @@ Exit codes:
     3010 Reboot pending (Post, for SCCM)
 #>
 
-[CmdletBinding()]
+[CmdletBinding(SupportsShouldProcess)]
 param(
     [string]$Stage = 'Pre',
     [string[]]$Proxies = @('F-1', 'M-1'),
     [ValidateRange(1, 3600)]
     [int]$PollDelay = 30,
     [ValidateRange(1, 1440)]
-    [int]$DrainTimeoutMinutes = 30
+    [int]$DrainTimeoutMinutes = 30,
+    [string]$VBRServer
 )
 
 $script:LogPath = $null
@@ -58,6 +59,89 @@ function Write-ProxyLog {
     if ($ToConsole) {
         Write-Host $Msg -ForegroundColor Cyan
     }
+}
+
+function Get-ProxyHostEnvironment {
+    [pscustomobject]@{
+        IsWindows = [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT
+        Is64BitProcess = [Environment]::Is64BitProcess
+        Edition = $PSVersionTable.PSEdition
+        Version = $PSVersionTable.PSVersion
+    }
+}
+
+function Get-ProxyVBRConfiguration {
+    param([string]$VBRServer)
+
+    $hostEnvironment = Get-ProxyHostEnvironment
+    if (-not $hostEnvironment.IsWindows -or -not $hostEnvironment.Is64BitProcess) {
+        throw 'Run this script in a 64-bit Windows PowerShell process on a Veeam Server or Console host.'
+    }
+
+    $products = @(
+        Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction Stop |
+            Where-Object { $_.DisplayName -in @('Veeam Backup & Replication Server', 'Veeam Backup & Replication Console') }
+    )
+    if ($products.Count -eq 0) {
+        throw 'No Veeam Server or Console installation metadata was found in the native HKLM Uninstall registry.'
+    }
+    $versions = @($products | ForEach-Object {
+        $parsed = $null
+        if (-not [version]::TryParse([string]$_.DisplayVersion, [ref]$parsed) -or $parsed.Build -lt 0) {
+            throw 'Veeam installation DisplayVersion is missing or malformed. Repair the Server/Console installation.'
+        }
+        $parsed
+    })
+    $release = $versions[0].ToString(3)
+    if (@($versions | Where-Object { $_.ToString(3) -ne $release }).Count -gt 0) {
+        throw 'Veeam Server and Console installation releases disagree. Repair the installation before maintenance.'
+    }
+    $version = $versions[0]
+    $edition = 'Core'
+    $minimum = [version]'7.0'
+    if ($version.Major -eq 12 -and $version -ge [version]'12.3.2') {
+        $edition = 'Desktop'
+        $minimum = [version]'5.1'
+    }
+    elseif ($version.Major -eq 13 -and $version.Minor -eq 1) {
+        $minimum = [version]'7.6.3'
+    }
+    elseif ($version.Major -ne 13 -or $version.Minor -ne 0) {
+        throw ('Unsupported installed Veeam release {0}. Supported releases are v12.3.2+, within v12, and v13.0/v13.1.' -f $version)
+    }
+    if ($hostEnvironment.Edition -ne $edition -or $hostEnvironment.Version -lt $minimum -or
+        ($edition -eq 'Desktop' -and $hostEnvironment.Version -ge [version]'6.0') -or
+        ($edition -eq 'Core' -and $hostEnvironment.Version.Major -ne 7)) {
+        throw ('Installed Veeam {0} requires {1} PowerShell {2} (v12 uses powershell.exe 5.1; v13 uses pwsh.exe 7.x). Running {3} {4}. Rerun the same arguments in the required 64-bit shell.' -f
+            $version, $edition, $minimum, $hostEnvironment.Edition, $hostEnvironment.Version)
+    }
+    if ([string]::IsNullOrWhiteSpace($VBRServer)) {
+        if ($products.DisplayName -contains 'Veeam Backup & Replication Server') {
+            $VBRServer = 'localhost'
+        }
+        else {
+            throw 'A Console-only host requires an explicit -VBRServer target.'
+        }
+    }
+
+    $modules = @(Get-Module -ListAvailable -Name Veeam.Backup.PowerShell -ErrorAction Stop |
+        Sort-Object -Property Path -Unique)
+    if ($modules.Count -ne 1 -or -not [IO.Path]::IsPathRooted($modules[0].Path)) {
+        throw 'Expected one unambiguous installed Veeam.Backup.PowerShell module path. Repair module discovery before maintenance.'
+    }
+    $module = $modules[0]
+    if (($module.PowerShellVersion -and $hostEnvironment.Version -lt $module.PowerShellVersion) -or
+        ($module.CompatiblePSEditions.Count -gt 0 -and $hostEnvironment.Edition -notin $module.CompatiblePSEditions)) {
+        throw ('The installed Veeam module manifest is incompatible with {0} {1}. Required minimum PowerShell: {2}; editions: {3}.' -f
+            $hostEnvironment.Edition, $hostEnvironment.Version, $module.PowerShellVersion, ($module.CompatiblePSEditions -join ', '))
+    }
+    $loaded = @(Get-Module -Name Veeam.Backup.PowerShell -ErrorAction Stop)
+    if (@($loaded | Where-Object { $_.Path -ne $module.Path }).Count -gt 0) {
+        throw 'A different Veeam module is already loaded. Start a clean PowerShell session and rerun.'
+    }
+    Write-ProxyLog ('Installed Veeam metadata: {0}; runtime: {1} {2}; target: {3}; module: {4}' -f
+        ($versions -join ', '), $hostEnvironment.Edition, $hostEnvironment.Version, $VBRServer, $module.Path) -ToConsole
+    [pscustomobject]@{ Version = $version; Server = $VBRServer; ModulePath = $module.Path }
 }
 
 function Wait-ProxyTasksToDrain {
@@ -176,11 +260,13 @@ function Invoke-ProxyMaintenance {
         [Parameter(Mandatory)]
         [int]$PollDelay,
         [Parameter(Mandatory)]
-        [int]$DrainTimeoutMinutes
+        [int]$DrainTimeoutMinutes,
+        [string]$VBRServer
     )
 
     $ErrorActionPreference = 'Stop'
     Initialize-ProxyLog
+    $ownsConnection = $false
 
     try {
         Write-ProxyLog ('Process begins (Stage: {0}, Proxies: {1})' -f $Stage, ($Proxies -join ', ')) -ToConsole
@@ -199,7 +285,26 @@ function Invoke-ProxyMaintenance {
             return 0
         }
 
-        Import-Module Veeam.Backup.PowerShell -ErrorAction Stop
+        $configuration = Get-ProxyVBRConfiguration -VBRServer $VBRServer
+        Import-Module -Name $configuration.ModulePath -ErrorAction Stop
+        if (@(Get-VBRServerSession -ErrorAction Stop).Count -gt 0) {
+            throw 'An existing Veeam connection is present. Start a clean PowerShell session and rerun; the existing session will not be disconnected.'
+        }
+        Connect-VBRServer -Server $configuration.Server -ErrorAction Stop | Out-Null
+        $ownsConnection = $true
+        $serverInfo = @(Get-VBRBackupServerInfo -ErrorAction Stop)
+        if ($serverInfo.Count -ne 1) {
+            throw 'Expected exactly one connected VBR server information object.'
+        }
+        $serverInfo = $serverInfo[0]
+        $serverVersion = $null
+        if (-not [version]::TryParse([string]$serverInfo.Build, [ref]$serverVersion) -or $serverVersion.Build -lt 0) {
+            throw 'The connected VBR server did not report a valid Build.'
+        }
+        Write-ProxyLog ('Connected VBR server: {0}; build: {1}; installed release metadata: {2}' -f $serverInfo.Name, $serverVersion, $configuration.Version) -ToConsole
+        if ($serverVersion.ToString(3) -ne $configuration.Version.ToString(3)) {
+            throw 'Connected VBR release differs from the installed Server/Console release. Use a matching Console installation.'
+        }
         $proxyObjects = @(Get-VBRViProxy -Name $Proxies -ErrorAction Stop)
         if ($proxyObjects.Count -eq 0) {
             Write-ProxyLog 'No matching proxies found.' 'ERROR' -ToConsole
@@ -267,8 +372,27 @@ function Invoke-ProxyMaintenance {
         Write-ProxyLog ('Unhandled error: {0}' -f $_) 'ERROR' -ToConsole
         return 99
     }
+    finally {
+        if ($ownsConnection) {
+            try {
+                Disconnect-VBRServer -ErrorAction Stop | Out-Null
+            }
+            catch {
+                Write-ProxyLog ('Unable to disconnect owned Veeam session: {0}' -f $_) 'WARN' -ToConsole
+            }
+        }
+    }
 }
 
 if ($MyInvocation.InvocationName -ne '.') {
-    exit (Invoke-ProxyMaintenance -Stage $Stage -Proxies $Proxies -PollDelay $PollDelay -DrainTimeoutMinutes $DrainTimeoutMinutes)
+    $maintenanceParameters = @{
+        Stage = $Stage; Proxies = $Proxies; VBRServer = $VBRServer
+        PollDelay = $PollDelay; DrainTimeoutMinutes = $DrainTimeoutMinutes
+    }
+    foreach ($commonParameter in @('WhatIf', 'Confirm')) {
+        if ($PSBoundParameters.ContainsKey($commonParameter)) {
+            $maintenanceParameters[$commonParameter] = $PSBoundParameters[$commonParameter]
+        }
+    }
+    exit (Invoke-ProxyMaintenance @maintenanceParameters)
 }

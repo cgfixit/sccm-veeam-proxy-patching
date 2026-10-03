@@ -25,3 +25,7 @@ This script operates with elevated privileges and interacts with infrastructure 
 - **WinRM**: The script uses `Invoke-Command` over WinRM. Ensure WinRM is configured with HTTPS (port 5986) or Kerberos authentication rather than basic/plaintext HTTP.
 - **Service account**: The Veeam Backup Administrator account used to run this script should follow least-privilege principles and must not have MFA enabled (Veeam PowerShell limitation per KB4535).
 - **Execution policy**: The script requires an execution policy that permits script execution. Use `RemoteSigned` or `AllSigned` rather than `Unrestricted`.
+
+- **Startup checks**: The script uses native Windows installed-product metadata to validate the required shell, then confirms the connected server build before proxy operations. It refuses unsupported or inconsistent releases with exit `99`. Run it in a fresh 64-bit process and pass an explicit `-VBRServer` on Console-only hosts.
+- **Veeam connections**: Connections use the current Windows identity. The script does not force TLS certificate acceptance or disconnect a pre-existing caller session. It closes only a session it opened.
+- **Validation boundary**: Mocked local checks verify control flow and return values. They do not establish live Veeam assembly, Windows installer metadata, task-to-proxy mapping, WinRM, or service compatibility. Validate those on a non-production deployment before rollout.
